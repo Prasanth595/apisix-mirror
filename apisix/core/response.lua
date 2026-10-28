@@ -62,6 +62,25 @@ function _M.exit_insert_callback(func, conf)
 end
 
 
+local function set_json_content_type(code)
+    -- Only terminal HTTP responses receive an automatic content type.
+    if ngx.config.subsystem ~= "http" or type(code) ~= "number" then
+        return
+    end
+
+    if code < 200 or code == 204 or code == 304 then
+        return
+    end
+
+    -- Preserve explicit types and headers that have already been sent.
+    if ngx.headers_sent or ngx_header["Content-Type"] ~= nil then
+        return
+    end
+
+    ngx_header["Content-Type"] = "application/json"
+end
+
+
 local resp_exit
 do
     local t = {}
@@ -118,6 +137,7 @@ function resp_exit(code, ...)
                 if err then
                     error("failed to encode data: " .. err, -2)
                 end
+                set_json_content_type(code)
                 ngx_print(encoded, "\n")
             else
                 ngx_print(body)
@@ -140,6 +160,7 @@ function resp_exit(code, ...)
         ngx.status = code
     end
 
+    local encoded_table = false
     for i = 1, select('#', ...) do
         local v = select(i, ...)
         if type(v) == "table" then
@@ -149,6 +170,7 @@ function resp_exit(code, ...)
             else
                 idx = idx + 1
                 t[idx] = body
+                encoded_table = true
                 idx = idx + 1
                 t[idx] = "\n"
             end
@@ -160,6 +182,11 @@ function resp_exit(code, ...)
     end
 
     if idx > 0 then
+        -- One encoded table occupies two chunks: JSON and its trailing newline.
+        -- Additional non-nil body arguments make the output ineligible for JSON typing.
+        if encoded_table and idx == 2 then
+            set_json_content_type(code)
+        end
         ngx_print(t)
     end
 
