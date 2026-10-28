@@ -19,6 +19,139 @@
 
 . ./t/cli/common.sh
 
+# Reuse a scan for ordinary values, including after a leading comment.
+unset YAML_SCAN_VALUE YAML_SCAN_MISSING YAML_SCAN_PREFIX
+resty -I . -I deps/share/lua/5.1 -I deps/lib/lua/5.1 /dev/stdin <<'LUA'
+local yaml = require("yaml")
+local scanner = yaml.scanner
+local scans = 0
+yaml.scanner = function(text)
+    scans = scans + 1
+    return scanner(text)
+end
+local ffi = require("ffi")
+ffi.cdef[[int setenv(const char *name, const char *value, int overwrite);
+          int unsetenv(const char *name);]]
+local file = require("apisix.cli.file")
+local lyaml = require("lyaml")
+local resolved
+for _, case in ipairs({
+    {'', "127.0.0.1"},
+    {'', "127.0.0.1:9091"},
+    {'', "apisix.example:9091"},
+    {'', "http://h:8080/p?q=1&x=2"},
+    {'', "hello world"},
+    {'', "中文"},
+    {'', "hello 世界 😀"},
+    {'"', "中文"},
+    {"'", "中文"},
+    {'"', "127.0.0.1"},
+    {'"', "127.0.0.1:9091"},
+    {"'", "127.0.0.1:9091"},
+    {'"', "http://127.0.0.1:8080/path?q=1&x=2#fragment"},
+    {"'", "http://127.0.0.1:8080/path?q=1&x=2#fragment"},
+    {'"', "it's data: [one, two] # text"},
+    {"'", 'a "quote" and C:\\path'},
+    {'"', ""},
+    {'', "127.0.0.1:9091", '${{YAML_SCAN_VALUE\n}}'},
+    {'"', "hello world", '${{YAML_SCAN_VALUE\r\n}}'},
+    {"'", "中文", '${{YAML_SCAN_VALUE\n}}'},
+    {'', "127.0.0.1:9091", '${{YAML_SCAN_VALUE:=中文\n}}'},
+}) do
+    assert(ffi.C.setenv("YAML_SCAN_VALUE", case[2], 1) == 0)
+    for _, n in ipairs({32, 256, 1024}) do
+        local parts = {"# header\nx:\n"}
+        for i = 1, n do
+            parts[#parts + 1] = '  - ' .. case[1] .. (case[3] or '${{YAML_SCAN_VALUE}}')
+                .. case[1] .. ' # ${{YAML_SCAN_MISSING}}\n'
+        end
+        scans = 0
+        resolved = assert(file.resolve_conf_var_in_text(table.concat(parts)))
+        local result = lyaml.load(resolved)
+        assert(#result.x == n)
+        for _, value in ipairs(result.x) do
+            assert(value == case[2])
+        end
+        assert(scans <= 2, "ordinary values must not rescan every prefix: " .. scans)
+    end
+end
+assert(ffi.C.unsetenv("YAML_SCAN_VALUE") == 0)
+assert(not (file.get_exported_vars() or {}).YAML_SCAN_MISSING)
+
+-- Block headers contain comments, but hashes in their bodies are data.
+for _, header in ipairs({"|", ">", "|-", ">+2"}) do
+    for _, newline in ipairs({"\n", "\r\n", "\r", "\194\133", "\226\128\168", "\226\128\169"}) do
+        scans = 0
+        resolved = assert(file.resolve_conf_var_in_text(
+            '# header' .. newline .. 'x: ' .. header .. ' # ${{YAML_SCAN_MISSING}}' .. newline
+            .. string.rep('  # ${{YAML_SCAN_VALUE:=ok\n}}' .. newline, 256)))
+        local value = lyaml.load(resolved).x
+        assert(value:find('# ok', 1, true) and not value:find('${{YAML_SCAN_VALUE', 1, true))
+        assert(scans == 1, "block references must share a scan: " .. scans)
+    end
+end
+-- A skipped multiline comment must retain its original line boundaries.
+for _, newline in ipairs({"\n", "\r\n", "\r", "\194\133", "\226\128\168", "\226\128\169"}) do
+    resolved = assert(file.resolve_conf_var_in_text(
+        '# ${{YAML_SCAN_MISSING:=ignored' .. newline .. 'x}}: "${{YAML_SCAN_VALUE:=ok}}"'))
+    assert(lyaml.load(resolved)["x}}"] == "ok")
+end
+
+-- Whitespace at a replacement boundary can turn a literal hash into a comment.
+for _, value in ipairs({"hello ", ""}) do
+    assert(ffi.C.setenv("YAML_SCAN_VALUE", value, 1) == 0)
+    resolved = assert(file.resolve_conf_var_in_text(
+        '# header\nx: ${{YAML_SCAN_VALUE}}# ${{YAML_SCAN_MISSING}}'))
+    assert(lyaml.load(resolved).x == (value == "" and lyaml.null or "hello"))
+end
+assert(ffi.C.setenv("YAML_SCAN_VALUE", " ", 1) == 0)
+resolved = assert(file.resolve_conf_var_in_text(
+    '# header\nx:${{YAML_SCAN_VALUE}}"# ${{YAML_SCAN_PREFIX:=kept}}"'))
+assert(lyaml.load(resolved).x == "# kept")
+for _, newline in ipairs({"\n", "\r\n", "\194\133", "\226\128\168", "\226\128\169"}) do
+    assert(ffi.C.setenv("YAML_SCAN_VALUE", "ok" .. newline .. "# ", 1) == 0)
+    resolved = assert(file.resolve_conf_var_in_text(
+        '# header\nx: ${{YAML_SCAN_VALUE}}${{YAML_SCAN_MISSING}}'))
+    assert(lyaml.load(resolved).x == "ok")
+end
+assert(ffi.C.unsetenv("YAML_SCAN_VALUE") == 0)
+
+-- Invalid UTF-8 must not let batch reuse hide a scanner failure.
+for _, value in ipairs({"\255", "\128", "\192\175", "\224\128\175",
+                       "\237\160\128", "\244\144\128\128", "\226\128"}) do
+    assert(ffi.C.setenv("YAML_SCAN_VALUE", value, 1) == 0)
+    local _, err = file.resolve_conf_var_in_text(
+        '# header\nx: ${{YAML_SCAN_VALUE}}\n# ${{YAML_SCAN_MISSING}}')
+    assert(err and err:find("YAML_SCAN_MISSING", 1, true))
+end
+assert(ffi.C.unsetenv("YAML_SCAN_VALUE") == 0)
+
+-- A replacement can change whether later references belong to comments.
+local cases = {
+    {"a: ${{YAML_SCAN_VALUE:=ok}}\n${{YAML_SCAN_PREFIX:=#}} ${{YAML_SCAN_MISSING}}\nx: ok",
+     "ok"},
+    {"${{YAML_SCAN_PREFIX:=# }}${{YAML_SCAN_MISSING}}\nx: ok", "ok"},
+    {"${{YAML_SCAN_PREFIX:=# header\nx:}} ${{YAML_SCAN_VALUE:=ok}}", "ok"},
+    {"x: ${{YAML_SCAN_PREFIX:=|-}}\n  # ${{YAML_SCAN_VALUE:=ok}}", "# ok"},
+    {'# header\nx: "${{YAML_SCAN_PREFIX:="}} # ${{YAML_SCAN_MISSING}}', ""},
+    {'# header\nx: "${{YAML_SCAN_VALUE:=ok\n}}"', "ok"},
+    {'# header\n${{YAML_SCAN_PREFIX:=x:}} "${{YAML_SCAN_VALUE:=ok}}'
+        .. ' # ${{YAML_SCAN_MISSING:=kept}}"', "ok # kept"},
+    {'# header\n${{YAML_SCAN_PREFIX:=x: "}}${{YAML_SCAN_VALUE:=ok}}'
+        .. ' # ${{YAML_SCAN_MISSING:=kept}}"', "ok # kept"},
+}
+for _, case in ipairs(cases) do
+    resolved = assert(file.resolve_conf_var_in_text(case[1]))
+    assert(lyaml.load(resolved).x == case[2])
+end
+for _, newline in ipairs({"\194\133", "\226\128\168", "\226\128\169"}) do
+    resolved = assert(file.resolve_conf_var_in_text(
+        '# ${{YAML_SCAN_MISSING:=ignored' .. newline .. 'x}}: "${{YAML_SCAN_VALUE:=ok}}"'))
+    assert(lyaml.load(resolved)["x}}"] == "ok")
+end
+print("passed: YAML scan reuse and syntax-changing substitutions")
+LUA
+
 standalone() {
     rm -f conf/apisix.yaml.link
     clean_up
@@ -659,6 +792,91 @@ if ! grep "can't find environment variable DEFINITELY_NOT_SET_VAR" output.log > 
 fi
 
 echo "passed: missing env var produces clear startup error"
+
+# test: unset env vars referenced only in commented-out lines must be ignored
+echo '
+apisix:
+  enable_admin: false
+deployment:
+  role: data_plane
+  role_data_plane:
+    config_provider: yaml
+' > conf/config.yaml
+
+echo '
+# ${{COMMENTED_UNSET_VAR}}
+routes:
+  -
+    uri: /test-commented-var
+    # indented comment: ${{ANOTHER_COMMENTED_UNSET_VAR}}
+    plugins:
+      response-rewrite:
+        body: "${{COMMENT_BODY:=commented-ok}}"
+        status_code: 200
+    upstream:
+      nodes:
+        "127.0.0.1:9091": 1
+      type: roundrobin
+#END
+' > conf/apisix.yaml
+
+unset COMMENTED_UNSET_VAR
+unset ANOTHER_COMMENTED_UNSET_VAR
+export COMMENT_BODY=commented-ok
+make init
+
+if ! make run > output.log 2>&1; then
+    cat output.log
+    echo "failed: make run should ignore env vars in commented-out lines"
+    exit 1
+fi
+
+wait_for_commented_body() {
+    local expected="$1"
+    for ((i = 0; i < 100; i++)); do
+        code=$(curl -o /tmp/response_body -s -m 1 -w '%{http_code}' \
+            http://127.0.0.1:9080/test-commented-var) || true
+        body=$(cat /tmp/response_body)
+        if [ "$code" = 200 ] && [ "$body" = "$expected" ]; then
+            return 0
+        fi
+        sleep 0.1
+    done
+    echo "failed: expected 200/$expected, got $code/$body"
+    cat logs/error.log
+    return 1
+}
+
+wait_for_commented_body "commented-ok"
+master_pid=$(cat logs/nginx.pid)
+
+# Change the file while the SAME instance runs. Allow the seconds-resolution
+# mtime to advance, then atomically publish a complete file with its #END marker.
+sleep 1.1
+cat > conf/apisix.yaml.next <<'YAML'
+# ${{COMMENTED_UNSET_VAR}}
+routes:
+  - uri: /test-commented-var # ${{ANOTHER_COMMENTED_UNSET_VAR}}
+    plugins:
+      response-rewrite:
+        body: |- # ${{ANOTHER_COMMENTED_UNSET_VAR}}
+          # ${{COMMENT_BODY
+          }}
+        status_code: 200
+    upstream:
+      nodes: {"127.0.0.1:9091": 1}
+      type: roundrobin
+#END
+YAML
+mv conf/apisix.yaml.next conf/apisix.yaml
+wait_for_commented_body "# commented-ok"
+
+test "$(cat logs/nginx.pid)" = "$master_pid"
+
+make stop
+sleep 0.5
+
+echo "passed: YAML comments, block scalars, cross-line references and runtime reload"
 
 git checkout conf/config.yaml
 git checkout conf/apisix.yaml

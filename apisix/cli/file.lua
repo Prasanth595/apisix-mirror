@@ -17,6 +17,7 @@
 
 local ngx = ngx
 local yaml = require("lyaml")
+local yaml_scan = require("yaml").scanner
 local profile = require("apisix.core.profile")
 local util = require("apisix.cli.util")
 local schema = require("apisix.cli.schema")
@@ -31,10 +32,13 @@ local getenv = os.getenv
 local str_gmatch = string.gmatch
 local str_find = string.find
 local str_sub = string.sub
+local concat = table.concat
 local print = print
+local pcall = pcall
 
 local _M = {}
 local exported_vars
+local var_pattern = "%$%{%{%s*([%w_]+[%:%=]?.-)%s*%}%}"
 
 
 function _M.get_exported_vars()
@@ -62,7 +66,7 @@ local function var_sub(val)
     local var_used = false
     -- we use '${{var}}' because '$var' and '${var}' are taken
     -- by Nginx
-    local new_val = val:gsub("%$%{%{%s*([%w_]+[%:%=]?.-)%s*%}%}", function(var)
+    local new_val = val:gsub(var_pattern, function(var)
         local i, j = var:find("%:%=")
         local default
         if i and j then
@@ -90,14 +94,171 @@ local function var_sub(val)
 end
 
 
+local function is_in_yaml_data(prefix)
+    if not str_find(prefix, "#", 1, true) then
+        return true
+    end
+
+    -- Scan only the already expanded prefix. The rest of the template
+    -- need not be valid YAML yet: this reference may supply a directive
+    -- argument, a quote, or a block-scalar header. libyaml discards real
+    -- comments but retains # in scalar data.
+    local marker = "APISIXENV"
+    local pos = #prefix:gsub("[\128-\191]", "")
+    -- Keep the borrowed scanner input alive throughout iteration.
+    local input = prefix .. marker
+    local in_data = false
+    local ok = pcall(function()
+        for token in yaml_scan(input) do
+            if token.end_mark.index > pos then
+                for _, value in pairs(token) do
+                    if type(value) == "string" and str_find(value, marker, 1, true) then
+                        in_data = true
+                    end
+                end
+            end
+        end
+    end)
+    -- An incomplete data token (e.g. an open quote or YAML escape)
+    -- cannot yet be scanned. Resolve it and let the final YAML parse
+    -- validate the completed document, as before.
+    return in_data or not ok
+end
+
+
+-- Classify references using single-line markers. Only lexically inert scalar values
+-- can reuse these positions; everything else uses the sequential resolver.
+local function scan_reference_contexts(text)
+    local references, parts, contexts = {}, {}, {}
+    local previous, pos, line = 1, 0, 0
+    local marker = "APISIXENV"
+    for first, reference, _, last in str_gmatch(text, "()(" .. var_pattern .. ")()") do
+        local gap = str_sub(text, previous, first - 1)
+        parts[#parts + 1] = gap
+        parts[#parts + 1] = marker
+        pos = pos + #gap:gsub("[\128-\191]", "")
+        local _, breaks = gap:gsub("\r\n", "\n"):gsub("\194\133", "\n")
+                             :gsub("\226\128[\168\169]", "\n"):gsub("[\r\n]", "")
+        line = line + breaks
+        references[#references + 1] = {first = pos, last = pos + #marker,
+                                      source = first, line = line}
+        contexts[first] = false
+        pos = pos + #marker
+        previous = last
+    end
+    parts[#parts + 1] = str_sub(text, previous)
+    if #references == 0 then
+        return contexts
+    end
+
+    -- Retain the scanner's borrowed input and use source spans, not decoded
+    -- marker values: an existing scalar may contain the same text or an escape.
+    local input = concat(parts)
+    local ok, supported = pcall(function()
+        local i = 1
+        for token in yaml_scan(input) do
+            while references[i] and references[i].first < token.end_mark.index do
+                local ref = references[i]
+                if ref.last > token.start_mark.index then
+                    if token.type ~= "SCALAR" or ref.first < token.start_mark.index
+                       or ref.last > token.end_mark.index then
+                        return false
+                    end
+                    -- Block headers may contain comments; their indented body is data.
+                    local header = (token.style == "LITERAL" or token.style == "FOLDED")
+                                   and ref.line == token.start_mark.line
+                    contexts[ref.source] = not header and token.style or false
+                end
+                i = i + 1
+            end
+        end
+        return true
+    end)
+    return ok and supported and contexts or nil
+end
+
+
+local function is_single_line_yaml_text(value)
+    if not str_find(value, "[^ -~]") then
+        return true
+    end
+
+    local length = 0
+    for char in str_gmatch(value, "[%z\1-\127\194-\244][\128-\191]*") do
+        local first = char:byte()
+        local size = first < 128 and 1 or first < 224 and 2 or first < 240 and 3 or 4
+        if #char ~= size then
+            return false
+        end
+        local code = size == 1 and first or first % (2 ^ (7 - size))
+        for i = 2, size do
+            code = code * 64 + char:byte(i) - 128
+        end
+        if (size == 2 and code < 128) or (size == 3 and code < 2048)
+           or (size == 4 and code < 65536) or code > 0x10ffff
+           or (code >= 0xd800 and code <= 0xdfff)
+           or code < 32 or (code >= 127 and code <= 159)
+           or code == 0x2028 or code == 0x2029 or code == 0xfeff
+           or code == 0xfffe or code == 0xffff then
+            return false
+        end
+        length = length + size
+    end
+    return length == #value
+end
+
+
 -- Substitute env vars in raw text before parsing. YAML parser then infers
 -- types naturally: `"${{VAR}}"` stays string, `${{VAR}}` infers from value.
 local function resolve_conf_var_in_text(text)
-    local new_text, _, err = var_sub(text)
-    if err then
-        return nil, err
+    local contexts = scan_reference_contexts(text)
+    local parts = {}
+    local previous = 1
+    for first, reference, _, last in str_gmatch(text, "()(" .. var_pattern .. ")()") do
+        parts[#parts + 1] = str_sub(text, previous, first - 1)
+        previous = last
+
+        local in_data = contexts and contexts[first]
+        if in_data == nil then
+            in_data = is_in_yaml_data(concat(parts))
+        end
+        local value = reference
+        if in_data then
+            local resolved, _, err = var_sub(reference)
+            if err then
+                return nil, err
+            end
+            value = resolved
+            if contexts then
+                -- Validate UTF-8 and exclude controls, YAML line breaks and BOMs.
+                local safe = is_single_line_yaml_text(value)
+                if in_data == "SINGLE_QUOTED" then
+                    safe = safe and not str_find(value, "'", 1, true)
+                elseif in_data == "DOUBLE_QUOTED" then
+                    safe = safe and not str_find(value, '["\\]')
+                else
+                    -- Keep plain scalar boundaries, including adjacent template text.
+                    -- A colon before '?' also fails scanning in libyaml flow scalars.
+                    safe = safe and value ~= ""
+                           and not str_find(value, "^[ %-%?:,.&*!%%@`]")
+                           and not str_find(value, "[#%[%]{}\"'\\|>,]")
+                           and not str_find(value, ":[ ?]")
+                           and not str_find(value, "[ :]$")
+                end
+                if not safe then
+                    contexts = nil
+                end
+            end
+        end
+        -- A skipped comment keeps the line breaks removed by the scan marker.
+        if not in_data and str_find(reference, "[\r\n\128-\255]") then
+            contexts = nil
+        end
+        parts[#parts + 1] = value
     end
-    return new_text
+    -- Iterate references in the original input only, never in inserted values.
+    parts[#parts + 1] = str_sub(text, previous)
+    return concat(parts)
 end
 
 
